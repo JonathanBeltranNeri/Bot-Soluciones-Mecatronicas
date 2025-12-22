@@ -6,15 +6,18 @@ from dotenv import load_dotenv
 import json
 ##cambio de nombre a streamlit_app.py
 
-# --- 1. CONFIGURACIÓN VISUAL ---
+# --- 1. CONFIGURACIÓN VISUAL Y CONEXIONES ---
 st.set_page_config(page_title="Asistente Mecatrónico", page_icon="🏭", layout="wide")
 
-# Cargar llaves
 load_dotenv()
+
 try:
     cliente_db = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     client_ia = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    MODELO_IA = "llama-3.1-8b-instant"
+    
+    # AGREGA ESTA LÍNEA OTRA VEZ (Es necesaria para 'pensar_busqueda')
+    MODELO_IA = "llama-3.1-8b-instant" 
+    
 except Exception as e:
     st.error(f"❌ Error crítico de conexión: {e}")
     st.stop()
@@ -122,8 +125,17 @@ def buscar_en_supabase(palabra_clave):
 
 def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
     """
-    VERSIÓN GOLD: Fusión de Consultor Técnico + Protocolo de Seguridad.
+    VERSIÓN MAESTRA: Prompt "Experto Accesible" + Redundancia de Modelos + Anti-Alucinaciones.
     """
+    
+    # LISTA DE MOTORES (Redundancia ante error 429)
+    LISTA_MODELOS = [
+        "llama-3.3-70b-versatile", # El Ferrari (Inteligente)
+        "llama-3.1-8b-instant",    # El Toyota (Rápido y económico)
+        "mixtral-8x7b-32768"       # El Jeep (Respaldo)
+    ]
+
+    # 1. Preparación de datos (JSON Limpio)
     info_stock = ""
     if productos_encontrados:
         productos_lite = []
@@ -132,13 +144,14 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
                 "Nombre": p.get("Nombre"),
                 "Precio": p.get("Precio"),
                 "SKU": p.get("SKU"),
-                "URL": p.get("URL_Web"),
-                "FOTO": p.get("URL_Imagen"),
-                # ESTO ES IMPORTANTE: Le damos un poco de la descripción técnica a la IA
-                "Desc_Tecnica": p.get("Descripcion_HTML", "")[:300] 
+                # BLINDAJE: Si el link viene vacío, ponemos texto para que la IA no invente
+                "URL_Web": p.get("URL_Web") or "No disponible",
+                "URL_Imagen": p.get("URL_Imagen") or "No disponible",
+                "Desc": p.get("Descripcion_HTML", "")[:300] 
             })
         info_stock = json.dumps(productos_lite, ensure_ascii=False)
     
+    # 2. EL CEREBRO (TU PROMPT DEFINITIVO)
     mensajes = [
         {"role": "system", "content": f"""
             Eres el Asistente Técnico Virtual de 'Soluciones Mecatrónicas'.
@@ -165,23 +178,38 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
         """}
     ]
     
-    # Agregar historial reciente (Formato Streamlit)
+    # Agregar historial reciente
     for msg in historial[-5:]:
         mensajes.append({"role": msg["role"], "content": msg["content"]})
     
-    prompt = f"Consulta: {usuario_input}"
+    # Contexto con los datos reales
+    prompt = f"El cliente dice: {usuario_input}"
     if info_stock:
-        prompt += f"\n[DATOS TÉCNICOS ENCONTRADOS: {info_stock}]"
+        prompt += f"\n[DATOS REALES DE ALMACÉN (NO INVENTAR): {info_stock}]"
     else:
-        prompt += "\n[SISTEMA: No hay búsqueda nueva. Usa tu memoria, respeta el protocolo de seguridad y asesora.]"
+        prompt += "\n[SISTEMA: No hay productos nuevos en esta búsqueda. Usa memoria y asesora.]"
     
     mensajes.append({"role": "user", "content": prompt})
 
-    try:
-        completion = client_ia.chat.completions.create(model=MODELO_IA, messages=mensajes)
-        return completion.choices[0].message.content
-    except Exception as e:
-        return "Lo siento, tuve un error de conexión con mi cerebro digital."
+    # 3. EJECUCIÓN CON REDUNDANCIA (Bucle de intentos)
+    errores_acumulados = []
+    for modelo_actual in LISTA_MODELOS:
+        try:
+            # Intentamos generar respuesta
+            completion = client_ia.chat.completions.create(
+                model=modelo_actual, 
+                messages=mensajes,
+                temperature=0.3 # Baja creatividad para que sea más exacto con los datos
+            )
+            return completion.choices[0].message.content
+        
+        except Exception as e:
+            # Si falla, registramos y pasamos al siguiente modelo
+            errores_acumulados.append(f"{modelo_actual}: {str(e)}")
+            continue
+
+    # Si todos fallan:
+    return f"🚨 Error de Sistema: Mis servidores neuronales están saturados. (Detalles: {errores_acumulados})"
 
 # --- 4. INTERFAZ GRÁFICA ---
 
