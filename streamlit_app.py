@@ -14,7 +14,7 @@ load_dotenv()
 try:
     cliente_db = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     client_ia = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    MODELO_IA = "llama-3.3-70b-versatile"
+    MODELO_IA = "llama-3.1-8b-instant"
 except Exception as e:
     st.error(f"❌ Error crítico de conexión: {e}")
     st.stop()
