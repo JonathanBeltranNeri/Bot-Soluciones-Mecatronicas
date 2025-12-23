@@ -84,7 +84,7 @@ def buscar_en_supabase(palabra_clave):
         # 1. Búsqueda amplia
         query = cliente_db.table('productos').select("*").or_(
             f"Nombre.ilike.%{termino}%,Descripcion_HTML.ilike.%{termino}%,Categoria_Final.ilike.%{termino}%"
-        ).limit(15)
+        ).limit(5)
         
         resultados_crudos = query.execute().data
         total_encontrados = len(resultados_crudos)
@@ -171,7 +171,7 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
 
     # --- CAMBIO TÉCNICO INVISIBLE: USAR VARIOS MODELOS SI UNO FALLA ---
     # Usamos Gemma 2 (Google) primero porque es muy estable, luego Mistral, luego Llama.
-    lista_modelos = ["gemma2-9b-it", "mixtral-8x7b-32768", "llama-3.3-70b-versatile"]
+    lista_modelos = ["llama-3.3-70b-versatile"]
 
     for modelo in lista_modelos:
         try:
