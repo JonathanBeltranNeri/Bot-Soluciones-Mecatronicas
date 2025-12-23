@@ -4,20 +4,18 @@ from groq import Groq
 from supabase import create_client
 from dotenv import load_dotenv
 import json
-##cambio de nombre a streamlit_app.py
 
-# --- 1. CONFIGURACIÓN VISUAL Y CONEXIONES ---
+# --- 1. CONFIGURACIÓN VISUAL ---
 st.set_page_config(page_title="Asistente Mecatrónico", page_icon="🏭", layout="wide")
 
+# Cargar llaves
 load_dotenv()
-
 try:
     cliente_db = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     client_ia = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # AGREGA ESTA LÍNEA OTRA VEZ (Es necesaria para 'pensar_busqueda')
-    MODELO_IA = "llama-3.1-8b-instant" 
-    
+    # Modelo rápido solo para tareas internas (detectar intención)
+    MODELO_RAPIDO = "llama-3.3-70b-versatile" 
 except Exception as e:
     st.error(f"❌ Error crítico de conexión: {e}")
     st.stop()
@@ -29,12 +27,11 @@ with st.sidebar:
     
     # KPI: CONTADOR REAL DE PRODUCTOS
     try:
-        # Consultamos a la DB cuántos productos existen realmente
         count_res = cliente_db.table('productos').select("SKU", count='exact', head=True).execute()
         TOTAL_PRODUCTOS = count_res.count
         st.metric(label="📦 Catálogo Total", value=f"{TOTAL_PRODUCTOS} Productos")
     except:
-        TOTAL_PRODUCTOS = 500 # Valor por defecto si falla la conexión
+        TOTAL_PRODUCTOS = 500 
         st.metric(label="📦 Catálogo", value="Error Conexión")
 
     st.divider()
@@ -51,28 +48,24 @@ with st.sidebar:
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "¡Hola! Soy tu Asistente Técnico. ¿Buscas algún componente o necesitas asesoría?"}]
 
-# --- 3. LÓGICA INTELIGENTE (EL CEREBRO OPTIMIZADO) ---
+# --- 3. LÓGICA INTELIGENTE ---
 
 def pensar_busqueda(texto_usuario):
     """Detecta intención. Si es charla o confirmación, no gasta recursos buscando."""
     texto = texto_usuario.lower()
-    
-    # Palabras que indican que NO hay que buscar en base de datos
     no_buscar = ['si', 'no', 'claro', 'gracias', 'ok', 'esta bien', 'ese', 'precio', 'detalles']
     
-    # Si la frase es corta y contiene esas palabras, es SEGUIMIENTO
     if any(p in texto for p in no_buscar) and len(texto.split()) < 8:
         return "SEGUIMIENTO_PURO"
 
     try:
-        # Prompt para extraer solo el producto clave
         prompt = f"""
         Tu trabajo es extraer el NOMBRE DEL PRODUCTO de esta frase: '{texto_usuario}'.
         1. Si es charla social o confirmación ("hola", "gracias", "sí"), responde 'SEGUIMIENTO_PURO'.
         2. Si busca un producto, responde SOLO EL NOMBRE (ej: "plc delta").
         """
         completion = client_ia.chat.completions.create(
-            model=MODELO_IA,
+            model=MODELO_RAPIDO,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=15
         )
@@ -81,7 +74,7 @@ def pensar_busqueda(texto_usuario):
         return texto_usuario
 
 def buscar_en_supabase(palabra_clave):
-    """Busca en DB con lógica 'Rayos X' para reportar qué pasa."""
+    """Busca en DB con lógica 'Rayos X'."""
     if palabra_clave == "SEGUIMIENTO_PURO" or len(palabra_clave) < 2:
         return [], 0, "🧠 Memoria (No se buscó en DB)"
 
@@ -96,16 +89,14 @@ def buscar_en_supabase(palabra_clave):
         resultados_crudos = query.execute().data
         total_encontrados = len(resultados_crudos)
 
-        # 2. Filtro Lógico (Anti-Basura)
+        # 2. Filtro Lógico
         datos_limpios = []
         log_filtro = "✅ Sin filtros agresivos"
         
-        # Regla: Si buscas "PLC", ignoramos tapas o botones baratos
         if "plc" in termino.lower():
             log_filtro = "⚠️ Filtro PLC activo (Eliminando tapas/conectores)"
             palabras_prohibidas = ["tapa", "boton", "conector", "receptaculo", "marco"]
             for p in resultados_crudos:
-                # Si cuesta menos de 500 y no dice "PLC" explícitamente, lo borramos
                 if p['Precio'] < 500 and "plc" not in p['Nombre'].lower():
                     continue 
                 if any(mal in p['Nombre'].lower() for mal in palabras_prohibidas):
@@ -114,7 +105,6 @@ def buscar_en_supabase(palabra_clave):
         else:
             datos_limpios = resultados_crudos
 
-        # Seguridad: Si el filtro borró todo, mostramos los crudos para no decir "no hay nada"
         if len(datos_limpios) == 0 and total_encontrados > 0:
              log_filtro = "🚨 ALERTA: Filtro demasiado estricto. Mostrando datos crudos."
              datos_limpios = resultados_crudos
@@ -125,17 +115,8 @@ def buscar_en_supabase(palabra_clave):
 
 def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
     """
-    VERSIÓN MAESTRA: Prompt "Experto Accesible" + Redundancia de Modelos + Anti-Alucinaciones.
+    Genera la respuesta usando TU prompt original, pero con soporte multi-modelo para no caerse.
     """
-    
-    # LISTA DE MOTORES (Redundancia ante error 429)
-    LISTA_MODELOS = [
-        "llama-3.3-70b-versatile", # El Ferrari (Inteligente)
-        "llama-3.1-8b-instant",    # El Toyota (Rápido y económico)
-        "mixtral-8x7b-32768"       # El Jeep (Respaldo)
-    ]
-
-    # 1. Preparación de datos (JSON Limpio)
     info_stock = ""
     if productos_encontrados:
         productos_lite = []
@@ -144,16 +125,14 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
                 "Nombre": p.get("Nombre"),
                 "Precio": p.get("Precio"),
                 "SKU": p.get("SKU"),
-                # BLINDAJE: Si el link viene vacío, ponemos texto para que la IA no invente
-                "URL_Web": p.get("URL_Web") or "No disponible",
-                "URL_Imagen": p.get("URL_Imagen") or "No disponible",
-                "Desc": p.get("Descripcion_HTML", "")[:300] 
+                "URL": p.get("URL_Web"),
+                "FOTO": p.get("URL_Imagen")
             })
         info_stock = json.dumps(productos_lite, ensure_ascii=False)
     
-    # 2. EL CEREBRO (TU PROMPT DEFINITIVO)
+    # --- AQUÍ ESTÁ TU PROMPT ORIGINAL (INTACTO) ---
     mensajes = [
-        {"role": "system", "content": f"""
+         {"role": "system", "content": f"""
             Eres el Asistente Técnico Virtual de 'Soluciones Mecatrónicas'.
             INVENTARIO: Tienes acceso a {TOTAL_PRODUCTOS} productos.
             
@@ -182,34 +161,26 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
     for msg in historial[-5:]:
         mensajes.append({"role": msg["role"], "content": msg["content"]})
     
-    # Contexto con los datos reales
-    prompt = f"El cliente dice: {usuario_input}"
+    prompt = f"Consulta: {usuario_input}"
     if info_stock:
-        prompt += f"\n[DATOS REALES DE ALMACÉN (NO INVENTAR): {info_stock}]"
+        prompt += f"\n[RESULTADOS DB: {info_stock}]"
     else:
-        prompt += "\n[SISTEMA: No hay productos nuevos en esta búsqueda. Usa memoria y asesora.]"
+        prompt += "\n[SISTEMA: No hay búsqueda nueva. Usa tu memoria y respeta el protocolo.]"
     
     mensajes.append({"role": "user", "content": prompt})
 
-    # 3. EJECUCIÓN CON REDUNDANCIA (Bucle de intentos)
-    errores_acumulados = []
-    for modelo_actual in LISTA_MODELOS:
-        try:
-            # Intentamos generar respuesta
-            completion = client_ia.chat.completions.create(
-                model=modelo_actual, 
-                messages=mensajes,
-                temperature=0.3 # Baja creatividad para que sea más exacto con los datos
-            )
-            return completion.choices[0].message.content
-        
-        except Exception as e:
-            # Si falla, registramos y pasamos al siguiente modelo
-            errores_acumulados.append(f"{modelo_actual}: {str(e)}")
-            continue
+    # --- CAMBIO TÉCNICO INVISIBLE: USAR VARIOS MODELOS SI UNO FALLA ---
+    # Usamos Gemma 2 (Google) primero porque es muy estable, luego Mistral, luego Llama.
+    lista_modelos = ["gemma2-9b-it", "mixtral-8x7b-32768", "llama-3.3-70b-versatile"]
 
-    # Si todos fallan:
-    return f"🚨 Error de Sistema: Mis servidores neuronales están saturados. (Detalles: {errores_acumulados})"
+    for modelo in lista_modelos:
+        try:
+            completion = client_ia.chat.completions.create(model=modelo, messages=mensajes)
+            return completion.choices[0].message.content
+        except Exception:
+            continue # Si falla, intenta el siguiente en silencio
+
+    return "Lo siento, tuve un error de conexión con mis cerebros digitales."
 
 # --- 4. INTERFAZ GRÁFICA ---
 
