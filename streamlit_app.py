@@ -185,7 +185,7 @@ def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
 # --- 4. INTERFAZ GRÁFICA ---
 
 st.title("🏭 Soluciones Mecatrónicas")
-st.caption("Asistente Técnico v6.2 (Web)")
+st.caption("Asistente Técnico (web)")
 
 # Mostrar historial
 for msg in st.session_state.messages:
