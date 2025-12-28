@@ -1,219 +1,268 @@
 import streamlit as st
 import os
+import json
+import unicodedata
+import re
 from groq import Groq
 from supabase import create_client
 from dotenv import load_dotenv
-import json
+from sentence_transformers import SentenceTransformer
 
-# --- 1. CONFIGURACIÓN VISUAL ---
-st.set_page_config(page_title="Asistente Mecatrónico", page_icon="🏭", layout="wide")
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
+st.set_page_config(page_title="Asistente Mecatrónico AI", page_icon="🤖", layout="wide")
 
-# Cargar llaves
 load_dotenv()
-try:
-    cliente_db = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-    client_ia = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    
-    # Modelo rápido solo para tareas internas (detectar intención)
-    MODELO_RAPIDO = "llama-3.3-70b-versatile" 
-except Exception as e:
-    st.error(f"❌ Error crítico de conexión: {e}")
-    st.stop()
 
-# --- 2. BARRA LATERAL (KPIs y DEBUG) ---
-with st.sidebar:
-    st.image("https://img.icons8.com/3d-fluency/94/robot-3.png", width=80)
-    st.title("Panel de Control")
-    
-    # KPI: CONTADOR REAL DE PRODUCTOS
+@st.cache_resource
+def init_connections():
     try:
-        count_res = cliente_db.table('productos').select("SKU", count='exact', head=True).execute()
-        TOTAL_PRODUCTOS = count_res.count
-        st.metric(label="📦 Catálogo Total", value=f"{TOTAL_PRODUCTOS} Productos")
-    except:
-        TOTAL_PRODUCTOS = 500 
-        st.metric(label="📦 Catálogo", value="Error Conexión")
-
-    st.divider()
-    
-    # HERRAMIENTA: MODO RAYOS X
-    st.write("🔧 **Ingeniería**")
-    debug_mode = st.toggle("Activar Rayos X (Debug)", value=False)
-    
-    if st.button("🗑️ Borrar Memoria"):
-        st.session_state.messages = [{"role": "assistant", "content": "Memoria reiniciada. ¿En qué proyecto te puedo ayudar hoy?"}]
-        st.rerun()
-
-# Inicializar Memoria del Chat
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "¡Hola! Soy tu Asistente Técnico. ¿Buscas algún componente o necesitas asesoría?"}]
-
-# --- 3. LÓGICA INTELIGENTE ---
-
-def pensar_busqueda(texto_usuario):
-    """Detecta intención. Si es charla o confirmación, no gasta recursos buscando."""
-    texto = texto_usuario.lower()
-    no_buscar = ['si', 'no', 'claro', 'gracias', 'ok', 'esta bien', 'ese', 'precio', 'detalles']
-    
-    if any(p in texto for p in no_buscar) and len(texto.split()) < 8:
-        return "SEGUIMIENTO_PURO"
-
-    try:
-        prompt = f"""
-        Tu trabajo es extraer el NOMBRE DEL PRODUCTO de esta frase: '{texto_usuario}'.
-        1. Si es charla social o confirmación ("hola", "gracias", "sí"), responde 'SEGUIMIENTO_PURO'.
-        2. Si busca un producto, responde SOLO EL NOMBRE (ej: "plc delta").
-        """
-        completion = client_ia.chat.completions.create(
-            model=MODELO_RAPIDO,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=15
-        )
-        return completion.choices[0].message.content.strip()
-    except:
-        return texto_usuario
-
-def buscar_en_supabase(palabra_clave):
-    """Busca en DB con lógica 'Rayos X'."""
-    if palabra_clave == "SEGUIMIENTO_PURO" or len(palabra_clave) < 2:
-        return [], 0, "🧠 Memoria (No se buscó en DB)"
-
-    termino = palabra_clave.split('\n')[0].replace('.', '').strip()
-    
-    try:
-        # 1. Búsqueda amplia
-        query = cliente_db.table('productos').select("*").or_(
-            f"Nombre.ilike.%{termino}%,Descripcion_HTML.ilike.%{termino}%,Categoria_Final.ilike.%{termino}%"
-        ).limit(5)
-        
-        resultados_crudos = query.execute().data
-        total_encontrados = len(resultados_crudos)
-
-        # 2. Filtro Lógico
-        datos_limpios = []
-        log_filtro = "✅ Sin filtros agresivos"
-        
-        if "plc" in termino.lower():
-            log_filtro = "⚠️ Filtro PLC activo (Eliminando tapas/conectores)"
-            palabras_prohibidas = ["tapa", "boton", "conector", "receptaculo", "marco"]
-            for p in resultados_crudos:
-                if p['Precio'] < 500 and "plc" not in p['Nombre'].lower():
-                    continue 
-                if any(mal in p['Nombre'].lower() for mal in palabras_prohibidas):
-                    continue
-                datos_limpios.append(p)
-        else:
-            datos_limpios = resultados_crudos
-
-        if len(datos_limpios) == 0 and total_encontrados > 0:
-             log_filtro = "🚨 ALERTA: Filtro demasiado estricto. Mostrando datos crudos."
-             datos_limpios = resultados_crudos
-
-        return datos_limpios, total_encontrados, log_filtro
+        supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+        groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        return supabase, groq, model
     except Exception as e:
-        return [], 0, f"Error DB: {e}"
+        st.error(f"❌ Error conectando cerebros: {e}")
+        return None, None, None
 
-def generar_respuesta_ia(usuario_input, productos_encontrados, historial):
+client_db, client_ia, model_embedding = init_connections()
+
+# --- 2. FUNCIONES DEL CEREBRO (LÓGICA DURA) ---
+
+def analizar_filtro_precio(texto):
     """
-    Genera la respuesta usando TU prompt original, pero con soporte multi-modelo para no caerse.
+    Analiza si el usuario quiere filtrar por precio.
+    Retorna:
+    - 'barato': Ordenar asc
+    - 'caro': Ordenar desc
+    - ('especifico', 4000): Buscar precio cercano a 4000
+    - None: Búsqueda normal
     """
-    info_stock = ""
-    if productos_encontrados:
-        productos_lite = []
-        for p in productos_encontrados:
-            productos_lite.append({
-                "Nombre": p.get("Nombre"),
-                "Precio": p.get("Precio"),
-                "SKU": p.get("SKU"),
-                "URL": p.get("URL_Web"),
-                "FOTO": p.get("URL_Imagen")
-            })
-        info_stock = json.dumps(productos_lite, ensure_ascii=False)
+    texto = texto.lower()
     
-    # --- AQUÍ ESTÁ TU PROMPT ORIGINAL (INTACTO) ---
-    mensajes = [
-         {"role": "system", "content": f"""
-            Eres el Asistente Técnico Virtual de 'Soluciones Mecatrónicas'.
-            INVENTARIO: Tienes acceso a {TOTAL_PRODUCTOS} productos.
-            
-            🚨 1. PROTOCOLO DE SEGURIDAD (PRIORIDAD MÁXIMA):
-            - TU ÚNICO PROPÓSITO: Asistencia en ingeniería y automatización.
-            - NO eres un vendedor que intenta cerrar una venta a la fuerza. NO tomes pedidos reales.
-            - PROHIBIDO: Opinar sobre celebridades, política, religión o temas personales.
-            - Si preguntan algo fuera de lugar: "Lo siento, mi programación se limita a soporte técnico industrial."
-            
-            🤝 2. PERSONALIDAD: "EL EXPERTO ACCESIBLE" (UNIVERSAL):
-            - TU META: Que CUALQUIER persona entienda (desde una secretaria hasta un experto).
-            - TONO: Amable, paciente, claro y servicial.
-            - LENGUAJE: Evita jerga técnica compleja a menos que sea necesaria. Explica fácil.
-            
-            🛠️ 3. LÓGICA DE ASESORÍA:
-            - SI ES UN PROYECTO (ej: "Quiero una banda transportadora"): Analiza qué componentes lógicos necesita (Motor, Sensor, PLC) y busca en el JSON qué le sirve.
-            - SI CONFIRMAN ("sí", "ese quiero"): Di "Perfecto. ¿Tienes alguna duda técnica sobre la conexión o voltaje antes de cerrar?" (Cierre suave).
-            
-            📸 4. FORMATO VISUAL:
-            - Siempre muestra FOTO: ![Nombre](URL_Imagen)
-            - Precio, SKU y Link.
-        """}
-    ]
+    # 1. Detección de número específico (ej: "de 4000 pesos", "unos 500")
+    # Buscamos números mayores a 50 (para evitar confundir con modelos o cantidades pequeñas)
+    numeros = re.findall(r'\d+', texto.replace(',', '').replace('$', ''))
+    numeros = [int(n) for n in numeros if int(n) > 50]
     
-    # Agregar historial reciente
-    for msg in historial[-5:]:
-        mensajes.append({"role": msg["role"], "content": msg["content"]})
+    if numeros:
+        return ('especifico', numeros[0]) # Retorna el primer precio grande que encuentre
+
+    # 2. Detección de Barato/Caro
+    if any(x in texto for x in ["barato", "económico", "economico", "menor precio", "menos cuesta", "bajo costo"]):
+        return "barato"
+    if any(x in texto for x in ["caro", "costoso", "mayor precio", "mejor calidad", "premium", "top"]):
+        return "caro"
     
-    prompt = f"Consulta: {usuario_input}"
-    if info_stock:
-        prompt += f"\n[RESULTADOS DB: {info_stock}]"
-    else:
-        prompt += "\n[SISTEMA: No hay búsqueda nueva. Usa tu memoria y respeta el protocolo.]"
+    return None
+
+def buscar_productos_vectorial(query_usuario, n_resultados=3):
+    """
+    Convierte texto a vector y pide a Supabase.
+    n_resultados es dinámico: Pedimos más si vamos a filtrar por precio.
+    """
+    try:
+        vector = model_embedding.encode(query_usuario).tolist()
+        response = client_db.rpc(
+            'buscar_productos', 
+            {
+                'query_embedding': vector,
+                'match_threshold': 0.25, 
+                'match_count': n_resultados 
+            }
+        ).execute()
+        return response.data
+    except Exception as e:
+        st.error(f"Error en búsqueda: {e}")
+        return []
+
+def contextualizar_consulta(query_actual, historial_mensajes):
+    """Reescribe la consulta usando el historial."""
+    # Si es muy larga, asumimos que tiene todo el contexto
+    if len(query_actual.split()) > 12:
+        return query_actual
+
+    ultimo_msg_usuario = ""
+    for msg in reversed(historial_mensajes):
+        if msg["role"] == "user" and msg["content"] != query_actual:
+            ultimo_msg_usuario = msg["content"]
+            break
+            
+    if not ultimo_msg_usuario:
+        return query_actual
+
+    # Prompt reescritura
+    prompt_rewrite = f"""
+    Contexto anterior: "{ultimo_msg_usuario}"
+    Usuario dice ahora: "{query_actual}"
     
-    mensajes.append({"role": "user", "content": prompt})
+    Tu tarea: Reescribe la búsqueda para que sea completa.
+    IGNORA PRECIOS o CANTIDADES en la reescritura. Solo me importa QUÉ PRODUCTO ES.
+    
+    Ej: Contexto="Busco PLC", Usuario="uno de 5000 pesos" -> Salida="PLC"
+    Ej: Contexto="Sensor", Usuario="el mas barato" -> Salida="Sensor"
+    
+    Solo devuelve la frase reescrita.
+    """
+    try:
+        chat = client_ia.chat.completions.create(
+            messages=[{"role": "system", "content": prompt_rewrite}],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1, max_tokens=40
+        )
+        return chat.choices[0].message.content.strip()
+    except:
+        return query_actual
 
-    # --- CAMBIO TÉCNICO INVISIBLE: USAR VARIOS MODELOS SI UNO FALLA ---
-    # Usamos Gemma 2 (Google) primero porque es muy estable, luego Mistral, luego Llama.
-    lista_modelos = ["llama-3.3-70b-versatile"]
+def generar_charla_social(mensaje_usuario):
+    """Respuesta rápida para saludos."""
+    try:
+        chat = client_ia.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "Eres el Asistente Técnico de Soluciones Mecatrónicas. Saluda amable y corto. Invita a cotizar."},
+                {"role": "user", "content": mensaje_usuario}
+            ],
+            model="llama-3.3-70b-versatile", temperature=0.6, max_tokens=80
+        )
+        return chat.choices[0].message.content
+    except:
+        return "¡Hola! Ingeniero a la orden. ¿Qué buscamos hoy?"
 
-    for modelo in lista_modelos:
-        try:
-            completion = client_ia.chat.completions.create(model=modelo, messages=mensajes)
-            return completion.choices[0].message.content
-        except Exception:
-            continue # Si falla, intenta el siguiente en silencio
+def generar_respuesta_tecnica(query_usuario, productos):
+    """Prompt Maestro RAG."""
+    if not productos:
+        return "🔍 No encontré coincidencias exactas en el inventario. ¿Podrías intentar con otro término o número de parte?"
 
-    return "Lo siento, tuve un error de conexión con mis cerebros digitales."
+    contexto_json = []
+    for p in productos:
+        contexto_json.append({
+            "nombre": p['nombre'],
+            "precio": p['precio'],
+            "sku": p.get('sku', 'S/N'),
+            "url": p['url_web'],
+            "img": p['url_imagen'],
+            "desc": p['descripcion'][:200]
+        })
+    
+    datos_str = json.dumps(contexto_json, indent=2, ensure_ascii=False)
+    
+    system_prompt = f"""
+    Eres el Asistente Técnico de 'Soluciones Mecatrónicas'.
+    INVENTARIO RECUPERADO ({len(productos)} opciones):
+    {datos_str}
+    
+    REGLAS:
+    1. Solo recomienda lo que está en la lista de arriba.
+    2. Si el usuario preguntó por precios (barato/caro/presupuesto), destaca el precio en tu respuesta.
+    3. Sé directo y técnico.
+    
+    FORMATO VISUAL:
+    **[Nombre]**
+    ![Foto]({{img}})
+    - 💰 ${{precio}} | SKU: {{sku}}
+    - [🔗 Ver Producto]({{url}})
+    """
 
-# --- 4. INTERFAZ GRÁFICA ---
+    try:
+        chat = client_ia.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query_usuario}
+            ],
+            model="llama-3.3-70b-versatile", temperature=0.1, max_tokens=700
+        )
+        return chat.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ Error IA: {e}"
 
-st.title("🏭 Soluciones Mecatrónicas")
-st.caption("Asistente Técnico (web)")
+def es_saludo_simple(texto):
+    texto_norm = ''.join(c for c in unicodedata.normalize('NFD', texto.lower()) if unicodedata.category(c) != 'Mn')
+    palabras = texto_norm.split()
+    if len(palabras) > 5: return False 
+    triggers = ["hola", "ola", "buenos", "buenas", "que tal", "saludos", "hi", "hello"]
+    if any(t in texto_norm for t in triggers): return True
+    return False
 
-# Mostrar historial
+# --- 3. INTERFAZ GRÁFICA ---
+
+with st.sidebar:
+    st.image("https://img.icons8.com/3d-fluency/94/robot-3.png", width=70)
+    st.markdown("### 🎛️ Panel de Ingeniería")
+    st.success("🟢 Sistema Online")
+    debug_mode = st.toggle("Modo Debug (Ver Lógica)", value=False)
+    if st.button("Limpiar Chat"):
+        st.session_state.messages = []; st.rerun()
+
+st.title("🏭 Soluciones Mecatrónicas AI")
+st.caption("Asistente Técnico Especializado")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "¡Hola! Soy tu copiloto de ingeniería. ¿Qué necesitas cotizar hoy?"}]
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Input usuario
-if prompt := st.chat_input("Escribe tu consulta..."):
-    # Guardar mensaje usuario
+# --- 4. LÓGICA PRINCIPAL ---
+if prompt := st.chat_input("Escribe aquí..."):
+    
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Procesamiento
-    keyword = pensar_busqueda(prompt)
-    resultados, count_raw, log_filtro = buscar_en_supabase(keyword)
-    
-    # VISOR DE RAYOS X (DEBUG)
-    if debug_mode:
-        with st.status("🔍 Procesando datos...", expanded=True):
-            st.write(f"**Intención:** `{keyword}`")
-            st.write(f"**Supabase:** {count_raw} encontrados.")
-            st.write(f"**Filtro:** {log_filtro}")
-
-    # Respuesta IA
     with st.chat_message("assistant"):
-        with st.spinner("Consultando manuales..."):
-            respuesta = generar_respuesta_ia(prompt, resultados, st.session_state.messages)
+        
+        # A. RUTA SOCIAL
+        if es_saludo_simple(prompt):
+            respuesta = generar_charla_social(prompt)
             st.markdown(respuesta)
-            
-    st.session_state.messages.append({"role": "assistant", "content": respuesta})
+            st.session_state.messages.append({"role": "assistant", "content": respuesta})
+        
+        # B. RUTA TÉCNICA
+        else:
+            with st.spinner("🔍 Analizando inventario..."):
+                
+                # 1. Detectar intención de precio
+                filtro_precio = analizar_filtro_precio(prompt)
+                
+                # 2. Contextualizar (Entender de qué producto hablamos)
+                query_optimizada = contextualizar_consulta(prompt, st.session_state.messages)
+                
+                # 3. Búsqueda Estratégica
+                # Si hay filtro de precio, traemos 12 productos para poder ordenar bien.
+                # Si no, traemos solo 3.
+                top_k = 12 if filtro_precio else 3
+                
+                productos = buscar_productos_vectorial(query_optimizada, n_resultados=top_k)
+                
+                # 4. ORDENAMIENTO INTELIGENTE (Python)
+                if productos and filtro_precio:
+                    
+                    if filtro_precio == "barato":
+                        # Ordenar menor a mayor
+                        productos.sort(key=lambda x: x['precio'])
+                        
+                    elif filtro_precio == "caro":
+                        # Ordenar mayor a menor
+                        productos.sort(key=lambda x: x['precio'], reverse=True)
+                        
+                    elif isinstance(filtro_precio, tuple) and filtro_precio[0] == 'especifico':
+                        # Ordenar por cercanía al precio objetivo (Target)
+                        target = filtro_precio[1]
+                        productos.sort(key=lambda x: abs(x['precio'] - target))
+                    
+                    # CORTAR: Nos quedamos con los 3 ganadores del ordenamiento
+                    productos = productos[:3]
+
+                # DEBUG
+                if debug_mode:
+                    with st.expander("🧠 Cerebro (Debug)"):
+                        st.write(f"**Query:** `{query_optimizada}`")
+                        st.write(f"**Filtro Detectado:** `{filtro_precio}`")
+                        st.write(f"**Productos Analizados:** {top_k} -> Se mostraron los mejores 3.")
+                        st.json(productos)
+                
+                # 5. Generar respuesta
+                respuesta = generar_respuesta_tecnica(query_optimizada, productos)
+                
+                st.markdown(respuesta)
+                st.session_state.messages.append({"role": "assistant", "content": respuesta})
