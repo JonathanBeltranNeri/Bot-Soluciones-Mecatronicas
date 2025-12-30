@@ -1,0 +1,15 @@
+[theme]
+# PALETA "CLEAN ENGINEERING"
+primaryColor = "#0056b3"        # Azul Ingeniero (Botones, acentos)
+backgroundColor = "#FFFFFF"     # Blanco Clínico (Fondo)
+secondaryBackgroundColor = "#F4F6F9" # Gris Azulado Muy Pálido (Sidebar)
+textColor = "#2c3e50"           # Gris Oscuro (Lectura descansada)
+font = "sans serif"             # Tipografía limpia (Helvetica/Arial)
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
